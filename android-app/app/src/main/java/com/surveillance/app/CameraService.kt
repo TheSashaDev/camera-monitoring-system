@@ -781,7 +781,20 @@ class CameraService : LifecycleService() {
             val iceServers = listOf(
                 PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer(),
                 PeerConnection.IceServer.builder("stun:stun1.l.google.com:19302").createIceServer(),
-                PeerConnection.IceServer.builder("stun:stun2.l.google.com:19302").createIceServer()
+                PeerConnection.IceServer.builder("stun:stun2.l.google.com:19302").createIceServer(),
+                // Free TURN servers for NAT traversal
+                PeerConnection.IceServer.builder("turn:openrelay.metered.ca:80")
+                    .setUsername("openrelayproject")
+                    .setPassword("openrelayproject")
+                    .createIceServer(),
+                PeerConnection.IceServer.builder("turn:openrelay.metered.ca:443")
+                    .setUsername("openrelayproject")
+                    .setPassword("openrelayproject")
+                    .createIceServer(),
+                PeerConnection.IceServer.builder("turn:openrelay.metered.ca:443?transport=tcp")
+                    .setUsername("openrelayproject")
+                    .setPassword("openrelayproject")
+                    .createIceServer()
             )
 
             val rtcConfig = PeerConnection.RTCConfiguration(iceServers).apply {
