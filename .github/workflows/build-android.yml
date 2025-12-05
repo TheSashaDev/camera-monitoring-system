@@ -31,14 +31,16 @@ jobs:
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: 8.4
 
-      - name: Grant execute permission for gradlew
-        run: chmod +x ./android-app/gradlew
-
-      - name: Download Gradle Wrapper
+      - name: Generate Gradle Wrapper
         run: |
           cd android-app
           gradle wrapper --gradle-version 8.4
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x ./android-app/gradlew
 
       - name: Build Debug APK
         run: |
