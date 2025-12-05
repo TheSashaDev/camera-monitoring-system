@@ -399,89 +399,86 @@ class CameraService : LifecycleService() {
         }
     }
 
+    private var cameraProvider: ProcessCameraProvider? = null
+    
     private fun setupCameras() {
         val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
 
         cameraProviderFuture.addListener({
             try {
-                val cameraProvider = cameraProviderFuture.get()
+                cameraProvider = cameraProviderFuture.get()
                 
-                // Unbind all before rebinding
-                cameraProvider.unbindAll()
+                // IMPORTANT: Unbind everything first to avoid lifecycle conflicts
+                cameraProvider?.unbindAll()
+                
+                log("Setting up cameras... (front=$hasFrontCamera, back=$hasBackCamera)")
 
                 val qualitySelector = QualitySelector.from(
                     Quality.HD,
                     FallbackStrategy.lowerQualityOrHigherThan(Quality.SD)
                 )
 
-                // Determine which camera to use
-                val useCamera = when {
-                    actualRecordingCamera == "front" && hasFrontCamera -> "front"
-                    actualRecordingCamera == "back" && hasBackCamera -> "back"
+                // Setup BACK camera first (usually primary)
+                if (hasBackCamera && backPreview != null) {
+                    try {
+                        val backRecorder = Recorder.Builder()
+                            .setQualitySelector(qualitySelector)
+                            .build()
+                        backVideoCapture = VideoCapture.withOutput(backRecorder)
+
+                        val backPreviewUseCase = Preview.Builder().build()
+                        backPreviewUseCase.setSurfaceProvider(backPreview!!.surfaceProvider)
+
+                        cameraProvider?.bindToLifecycle(
+                            this,
+                            CameraSelector.DEFAULT_BACK_CAMERA,
+                            backPreviewUseCase,
+                            backVideoCapture
+                        )
+                        log("Back camera initialized OK")
+                    } catch (e: Exception) {
+                        hasBackCamera = false
+                        backVideoCapture = null
+                        log("Back camera FAILED: ${e.message}")
+                        Log.e(TAG, "Back camera error", e)
+                    }
+                }
+
+                // Setup FRONT camera separately with its own binding
+                if (hasFrontCamera && frontPreview != null) {
+                    try {
+                        val frontRecorder = Recorder.Builder()
+                            .setQualitySelector(qualitySelector)
+                            .build()
+                        frontVideoCapture = VideoCapture.withOutput(frontRecorder)
+
+                        val frontPreviewUseCase = Preview.Builder().build()
+                        frontPreviewUseCase.setSurfaceProvider(frontPreview!!.surfaceProvider)
+
+                        cameraProvider?.bindToLifecycle(
+                            this,
+                            CameraSelector.DEFAULT_FRONT_CAMERA,
+                            frontPreviewUseCase,
+                            frontVideoCapture
+                        )
+                        log("Front camera initialized OK")
+                    } catch (e: Exception) {
+                        hasFrontCamera = false
+                        frontVideoCapture = null
+                        log("Front camera FAILED: ${e.message}")
+                        Log.e(TAG, "Front camera error", e)
+                    }
+                }
+                
+                // Update actual recording camera
+                actualRecordingCamera = when {
+                    hasBackCamera && hasFrontCamera -> "both"
                     hasBackCamera -> "back"
                     hasFrontCamera -> "front"
                     else -> "none"
                 }
                 
-                log("Setting up camera: $useCamera")
-
-                when (useCamera) {
-                    "front" -> {
-                        try {
-                            val recorder = Recorder.Builder()
-                                .setQualitySelector(qualitySelector)
-                                .build()
-                            frontVideoCapture = VideoCapture.withOutput(recorder)
-
-                            frontPreview?.let { preview ->
-                                val previewUseCase = Preview.Builder().build()
-                                previewUseCase.setSurfaceProvider(preview.surfaceProvider)
-
-                                cameraProvider.bindToLifecycle(
-                                    this,
-                                    CameraSelector.DEFAULT_FRONT_CAMERA,
-                                    previewUseCase,
-                                    frontVideoCapture
-                                )
-                                log("Front camera initialized successfully")
-                            }
-                        } catch (e: Exception) {
-                            hasFrontCamera = false
-                            log("Front camera init error: ${e.message}")
-                            Log.e(TAG, "Front camera error", e)
-                        }
-                    }
-                    "back" -> {
-                        try {
-                            val recorder = Recorder.Builder()
-                                .setQualitySelector(qualitySelector)
-                                .build()
-                            backVideoCapture = VideoCapture.withOutput(recorder)
-
-                            backPreview?.let { preview ->
-                                val previewUseCase = Preview.Builder().build()
-                                previewUseCase.setSurfaceProvider(preview.surfaceProvider)
-
-                                cameraProvider.bindToLifecycle(
-                                    this,
-                                    CameraSelector.DEFAULT_BACK_CAMERA,
-                                    previewUseCase,
-                                    backVideoCapture
-                                )
-                                log("Back camera initialized successfully")
-                            }
-                        } catch (e: Exception) {
-                            hasBackCamera = false
-                            log("Back camera init error: ${e.message}")
-                            Log.e(TAG, "Back camera error", e)
-                        }
-                    }
-                    else -> {
-                        log("No camera available to setup")
-                    }
-                }
-                
-                actualRecordingCamera = useCamera
+                log("Cameras ready: $actualRecordingCamera")
                 callbacks?.onCameraInfoUpdated(hasFrontCamera, hasBackCamera, preferredCamera)
 
             } catch (e: Exception) {
@@ -658,12 +655,25 @@ class CameraService : LifecycleService() {
     private suspend fun uploadRecordingImmediate(file: File, cameraType: String, startedAt: Long, retryCount: Int = 0) {
         val maxRetries = 3
         
+        if (!file.exists()) {
+            log("Upload SKIP: file doesn't exist ${file.name}")
+            return
+        }
+        
+        if (file.length() == 0L) {
+            log("Upload SKIP: file is empty ${file.name}")
+            file.delete()
+            return
+        }
+        
+        val fileSizeKB = file.length() / 1024
+        val uploadUrl = "$serverUrl/api/recordings/$deviceId"
+        
+        log("UPLOAD START: ${file.name} (${fileSizeKB}KB) -> $uploadUrl")
+        
         try {
             val endedAt = System.currentTimeMillis()
             val duration = ((endedAt - startedAt) / 1000).toInt()
-            val fileSizeKB = file.length() / 1024
-
-            log("Uploading ${file.name} (${fileSizeKB}KB)...")
 
             val requestBody = MultipartBody.Builder()
                 .setType(MultipartBody.FORM)
@@ -675,34 +685,39 @@ class CameraService : LifecycleService() {
                 .build()
 
             val request = Request.Builder()
-                .url("$serverUrl/api/recordings/$deviceId")
+                .url(uploadUrl)
                 .post(requestBody)
                 .build()
 
+            log("UPLOAD SENDING: ${file.name}...")
+            
             val success = httpClient.newCall(request).execute().use { response ->
+                val responseBody = response.body?.string() ?: ""
                 if (response.isSuccessful) {
-                    log("Uploaded: ${file.name}")
+                    log("UPLOAD OK: ${file.name} - ${response.code}")
                     true
                 } else {
-                    log("Upload failed (${response.code}): ${file.name}")
+                    log("UPLOAD FAIL: ${file.name} - ${response.code} - $responseBody")
                     false
                 }
             }
             
             if (success) {
                 if (file.delete()) {
-                    log("Deleted local: ${file.name}")
+                    log("DELETED: ${file.name}")
                 }
             } else if (retryCount < maxRetries) {
-                delay(5000) // Short retry delay
+                log("UPLOAD RETRY ${retryCount + 1}/$maxRetries: ${file.name}")
+                delay(5000)
                 uploadRecordingImmediate(file, cameraType, startedAt, retryCount + 1)
             } else {
-                log("Upload failed after $maxRetries attempts: ${file.name}")
-                // Keep file for manual recovery
+                log("UPLOAD GAVE UP after $maxRetries attempts: ${file.name}")
             }
         } catch (e: Exception) {
-            log("Upload error: ${e.message}")
+            log("UPLOAD ERROR: ${e.javaClass.simpleName}: ${e.message}")
+            Log.e(TAG, "Upload exception", e)
             if (retryCount < maxRetries) {
+                log("UPLOAD RETRY ${retryCount + 1}/$maxRetries after error")
                 delay(5000)
                 uploadRecordingImmediate(file, cameraType, startedAt, retryCount + 1)
             }
