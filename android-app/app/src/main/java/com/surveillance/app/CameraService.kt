@@ -68,16 +68,18 @@ class CameraService : LifecycleService() {
     private var actualRecordingCamera: String = "back" // Which camera is actually being used
 
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val uploadScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val httpClient = OkHttpClient.Builder()
-        .connectTimeout(60, TimeUnit.SECONDS)
-        .writeTimeout(180, TimeUnit.SECONDS)
-        .readTimeout(60, TimeUnit.SECONDS)
+        .connectTimeout(30, TimeUnit.SECONDS)
+        .writeTimeout(120, TimeUnit.SECONDS)
+        .readTimeout(30, TimeUnit.SECONDS)
         .retryOnConnectionFailure(true)
+        .connectionPool(ConnectionPool(5, 30, TimeUnit.SECONDS))
         .build()
     private val cameraExecutor = Executors.newSingleThreadExecutor()
     private val mainHandler = Handler(Looper.getMainLooper())
 
-    private val CHUNK_DURATION_MS = 15 * 60 * 1000L // 15 minutes
+    private val CHUNK_DURATION_MS = 30 * 1000L // 30 seconds - fast upload chunks
     private var chunkHandler: Handler? = null
     private var chunkRunnable: Runnable? = null
 
@@ -497,7 +499,7 @@ class CameraService : LifecycleService() {
         startRecordingChunk()
         scheduleNextChunk()
 
-        log("Recording started using $actualRecordingCamera camera (15-min chunks)")
+        log("Recording started using $actualRecordingCamera camera (30-sec fast chunks)")
     }
 
     private fun startRecordingChunk() {
@@ -587,7 +589,7 @@ class CameraService : LifecycleService() {
         chunkHandler = Handler(Looper.getMainLooper())
         chunkRunnable = Runnable {
             if (isRecording.get()) {
-                log("Starting new 15-minute chunk...")
+                log("Starting new chunk...")
                 try {
                     frontRecording?.stop()
                     backRecording?.stop()
@@ -632,49 +634,69 @@ class CameraService : LifecycleService() {
     }
     
     private fun queueUpload(file: File, cameraType: String, startedAt: Long) {
-        synchronized(uploadRetryQueue) {
-            uploadRetryQueue.add(UploadTask(file, cameraType, startedAt))
+        // Immediate parallel upload - don't queue, just upload directly
+        uploadScope.launch {
+            uploadRecordingImmediate(file, cameraType, startedAt)
         }
-        processUploadQueue()
     }
     
-    private fun processUploadQueue() {
-        if (isUploading.getAndSet(true)) return
+    private suspend fun uploadRecordingImmediate(file: File, cameraType: String, startedAt: Long, retryCount: Int = 0) {
+        val maxRetries = 3
         
-        scope.launch {
-            try {
-                while (true) {
-                    val task = synchronized(uploadRetryQueue) {
-                        uploadRetryQueue.firstOrNull()
-                    } ?: break
-                    
-                    val success = uploadRecording(task)
-                    
-                    var shouldDelay = false
-                    synchronized(uploadRetryQueue) {
-                        if (success) {
-                            uploadRetryQueue.remove(task)
-                        } else {
-                            task.retryCount++
-                            if (task.retryCount >= 5) {
-                                log("Upload failed after 5 attempts: ${task.file.name}")
-                                uploadRetryQueue.remove(task)
-                            } else {
-                                // Move to end of queue for retry
-                                uploadRetryQueue.remove(task)
-                                uploadRetryQueue.add(task)
-                                shouldDelay = true
-                            }
-                        }
-                    }
-                    if (shouldDelay) {
-                        delay(30000) // Wait before retry
-                    }
+        try {
+            val endedAt = System.currentTimeMillis()
+            val duration = ((endedAt - startedAt) / 1000).toInt()
+            val fileSizeKB = file.length() / 1024
+
+            log("Uploading ${file.name} (${fileSizeKB}KB)...")
+
+            val requestBody = MultipartBody.Builder()
+                .setType(MultipartBody.FORM)
+                .addFormDataPart("video", file.name, file.asRequestBody("video/mp4".toMediaType()))
+                .addFormDataPart("cameraType", cameraType)
+                .addFormDataPart("duration", duration.toString())
+                .addFormDataPart("startedAt", (startedAt / 1000).toString())
+                .addFormDataPart("endedAt", (endedAt / 1000).toString())
+                .build()
+
+            val request = Request.Builder()
+                .url("$serverUrl/api/recordings/$deviceId")
+                .post(requestBody)
+                .build()
+
+            val success = httpClient.newCall(request).execute().use { response ->
+                if (response.isSuccessful) {
+                    log("Uploaded: ${file.name}")
+                    true
+                } else {
+                    log("Upload failed (${response.code}): ${file.name}")
+                    false
                 }
-            } finally {
-                isUploading.set(false)
+            }
+            
+            if (success) {
+                if (file.delete()) {
+                    log("Deleted local: ${file.name}")
+                }
+            } else if (retryCount < maxRetries) {
+                delay(5000) // Short retry delay
+                uploadRecordingImmediate(file, cameraType, startedAt, retryCount + 1)
+            } else {
+                log("Upload failed after $maxRetries attempts: ${file.name}")
+                // Keep file for manual recovery
+            }
+        } catch (e: Exception) {
+            log("Upload error: ${e.message}")
+            if (retryCount < maxRetries) {
+                delay(5000)
+                uploadRecordingImmediate(file, cameraType, startedAt, retryCount + 1)
             }
         }
+    }
+    
+    // Keep old method for compatibility but unused
+    private fun processUploadQueue() {
+        // Deprecated - using immediate uploads now
     }
 
     private suspend fun uploadRecording(task: UploadTask): Boolean {
@@ -1071,6 +1093,7 @@ class CameraService : LifecycleService() {
             try { wakeLock?.release() } catch (e: Exception) { }
             cameraExecutor.shutdown()
             scope.cancel()
+            uploadScope.cancel()
         } catch (e: Exception) {
             Log.e(TAG, "Destroy error", e)
         }
