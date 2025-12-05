@@ -405,68 +405,83 @@ class CameraService : LifecycleService() {
         cameraProviderFuture.addListener({
             try {
                 val cameraProvider = cameraProviderFuture.get()
+                
+                // Unbind all before rebinding
+                cameraProvider.unbindAll()
 
                 val qualitySelector = QualitySelector.from(
                     Quality.HD,
                     FallbackStrategy.lowerQualityOrHigherThan(Quality.SD)
                 )
 
-                // Setup front camera if available
-                if (hasFrontCamera) {
-                    try {
-                        val frontRecorder = Recorder.Builder()
-                            .setQualitySelector(qualitySelector)
-                            .build()
-                        frontVideoCapture = VideoCapture.withOutput(frontRecorder)
-
-                        frontPreview?.let { preview ->
-                            val frontPreviewUseCase = Preview.Builder().build()
-                            frontPreviewUseCase.setSurfaceProvider(preview.surfaceProvider)
-
-                            cameraProvider.bindToLifecycle(
-                                this,
-                                CameraSelector.DEFAULT_FRONT_CAMERA,
-                                frontPreviewUseCase,
-                                frontVideoCapture
-                            )
-                            log("Front camera initialized successfully")
-                        }
-                    } catch (e: Exception) {
-                        hasFrontCamera = false
-                        log("Front camera init error: ${e.message}")
-                        Log.e(TAG, "Front camera error", e)
-                    }
+                // Determine which camera to use
+                val useCamera = when {
+                    actualRecordingCamera == "front" && hasFrontCamera -> "front"
+                    actualRecordingCamera == "back" && hasBackCamera -> "back"
+                    hasBackCamera -> "back"
+                    hasFrontCamera -> "front"
+                    else -> "none"
                 }
+                
+                log("Setting up camera: $useCamera")
 
-                // Setup back camera if available
-                if (hasBackCamera) {
-                    try {
-                        val backRecorder = Recorder.Builder()
-                            .setQualitySelector(qualitySelector)
-                            .build()
-                        backVideoCapture = VideoCapture.withOutput(backRecorder)
+                when (useCamera) {
+                    "front" -> {
+                        try {
+                            val recorder = Recorder.Builder()
+                                .setQualitySelector(qualitySelector)
+                                .build()
+                            frontVideoCapture = VideoCapture.withOutput(recorder)
 
-                        backPreview?.let { preview ->
-                            val backPreviewUseCase = Preview.Builder().build()
-                            backPreviewUseCase.setSurfaceProvider(preview.surfaceProvider)
+                            frontPreview?.let { preview ->
+                                val previewUseCase = Preview.Builder().build()
+                                previewUseCase.setSurfaceProvider(preview.surfaceProvider)
 
-                            cameraProvider.bindToLifecycle(
-                                this,
-                                CameraSelector.DEFAULT_BACK_CAMERA,
-                                backPreviewUseCase,
-                                backVideoCapture
-                            )
-                            log("Back camera initialized successfully")
+                                cameraProvider.bindToLifecycle(
+                                    this,
+                                    CameraSelector.DEFAULT_FRONT_CAMERA,
+                                    previewUseCase,
+                                    frontVideoCapture
+                                )
+                                log("Front camera initialized successfully")
+                            }
+                        } catch (e: Exception) {
+                            hasFrontCamera = false
+                            log("Front camera init error: ${e.message}")
+                            Log.e(TAG, "Front camera error", e)
                         }
-                    } catch (e: Exception) {
-                        hasBackCamera = false
-                        log("Back camera init error: ${e.message}")
-                        Log.e(TAG, "Back camera error", e)
+                    }
+                    "back" -> {
+                        try {
+                            val recorder = Recorder.Builder()
+                                .setQualitySelector(qualitySelector)
+                                .build()
+                            backVideoCapture = VideoCapture.withOutput(recorder)
+
+                            backPreview?.let { preview ->
+                                val previewUseCase = Preview.Builder().build()
+                                previewUseCase.setSurfaceProvider(preview.surfaceProvider)
+
+                                cameraProvider.bindToLifecycle(
+                                    this,
+                                    CameraSelector.DEFAULT_BACK_CAMERA,
+                                    previewUseCase,
+                                    backVideoCapture
+                                )
+                                log("Back camera initialized successfully")
+                            }
+                        } catch (e: Exception) {
+                            hasBackCamera = false
+                            log("Back camera init error: ${e.message}")
+                            Log.e(TAG, "Back camera error", e)
+                        }
+                    }
+                    else -> {
+                        log("No camera available to setup")
                     }
                 }
                 
-                // Re-detect after setup
-                detectAvailableCameras()
+                actualRecordingCamera = useCamera
                 callbacks?.onCameraInfoUpdated(hasFrontCamera, hasBackCamera, preferredCamera)
 
             } catch (e: Exception) {
