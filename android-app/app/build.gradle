@@ -65,6 +65,9 @@ dependencies {
     implementation "androidx.camera:camera-video:$camerax_version"
     implementation "androidx.camera:camera-view:$camerax_version"
 
+    // WebRTC for live streaming
+    implementation 'io.getstream:stream-webrtc-android:1.1.1'
+
     // Socket.IO
     implementation('io.socket:socket.io-client:2.1.0') {
         exclude group: 'org.json', module: 'json'

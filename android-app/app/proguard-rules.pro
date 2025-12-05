@@ -11,5 +11,9 @@
 # Gson
 -keep class com.google.gson.** { *; }
 
+# WebRTC
+-keep class org.webrtc.** { *; }
+-dontwarn org.webrtc.**
+
 # Keep app models
 -keep class com.surveillance.app.** { *; }

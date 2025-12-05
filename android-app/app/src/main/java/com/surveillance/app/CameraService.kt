@@ -8,7 +8,9 @@ import android.app.Service
 import android.content.Intent
 import android.os.Binder
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.os.PowerManager
 import android.util.Log
 import androidx.camera.core.CameraSelector
@@ -27,8 +29,10 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.asRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
+import org.webrtc.*
 import java.io.File
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 
 class CameraService : LifecycleService() {
 
@@ -47,13 +51,33 @@ class CameraService : LifecycleService() {
     private var frontRecording: Recording? = null
     private var backRecording: Recording? = null
     private var isRecording = false
+    private var recordingStartTime: Long = 0
 
     private var frontVideoCapture: VideoCapture<Recorder>? = null
     private var backVideoCapture: VideoCapture<Recorder>? = null
 
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
-    private val httpClient = OkHttpClient()
+    private val httpClient = OkHttpClient.Builder()
+        .connectTimeout(60, TimeUnit.SECONDS)
+        .writeTimeout(120, TimeUnit.SECONDS)
+        .readTimeout(60, TimeUnit.SECONDS)
+        .build()
     private val cameraExecutor = Executors.newSingleThreadExecutor()
+    private val mainHandler = Handler(Looper.getMainLooper())
+
+    // Recording chunk settings
+    private val CHUNK_DURATION_MS = 15 * 60 * 1000L // 15 minutes
+    private var chunkHandler: Handler? = null
+    private var chunkRunnable: Runnable? = null
+
+    // WebRTC
+    private var peerConnectionFactory: PeerConnectionFactory? = null
+    private val peerConnections = mutableMapOf<String, PeerConnection>()
+    private var eglBase: EglBase? = null
+    private var localVideoTrack: VideoTrack? = null
+    private var localAudioTrack: AudioTrack? = null
+    private var videoCapturer: CameraVideoCapturer? = null
+    private var surfaceTextureHelper: SurfaceTextureHelper? = null
 
     interface ServiceCallbacks {
         fun onConnectionStatusChanged(connected: Boolean)
@@ -76,6 +100,7 @@ class CameraService : LifecycleService() {
         acquireWakeLock()
         createNotificationChannel()
         startForeground(NOTIFICATION_ID, createNotification("Initializing..."))
+        initWebRTC()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -111,6 +136,30 @@ class CameraService : LifecycleService() {
         socket = null
         callbacks?.onConnectionStatusChanged(false)
         log("Disconnected from server")
+    }
+
+    private fun initWebRTC() {
+        try {
+            eglBase = EglBase.create()
+            
+            PeerConnectionFactory.initialize(
+                PeerConnectionFactory.InitializationOptions.builder(this)
+                    .setEnableInternalTracer(false)
+                    .createInitializationOptions()
+            )
+
+            val options = PeerConnectionFactory.Options()
+            peerConnectionFactory = PeerConnectionFactory.builder()
+                .setOptions(options)
+                .setVideoEncoderFactory(DefaultVideoEncoderFactory(eglBase?.eglBaseContext, true, true))
+                .setVideoDecoderFactory(DefaultVideoDecoderFactory(eglBase?.eglBaseContext))
+                .createPeerConnectionFactory()
+
+            log("WebRTC initialized")
+        } catch (e: Exception) {
+            log("WebRTC init error: ${e.message}")
+            Log.e(TAG, "WebRTC init error", e)
+        }
     }
 
     private fun connectToServer() {
@@ -161,29 +210,29 @@ class CameraService : LifecycleService() {
 
             socket?.on("command:start_recording") { args ->
                 val data = args.firstOrNull() as? JSONObject
-                val cameras = data?.optJSONArray("cameras")
                 log("Received start recording command")
-                startRecording()
+                mainHandler.post { startRecording() }
             }
 
             socket?.on("command:stop_recording") {
                 log("Received stop recording command")
-                stopRecording()
+                mainHandler.post { stopRecording() }
             }
 
+            // WebRTC signaling
             socket?.on("webrtc:offer") { args ->
                 val data = args.firstOrNull() as? JSONObject ?: return@on
-                handleWebRTCOffer(data)
+                mainHandler.post { handleWebRTCOffer(data) }
             }
 
             socket?.on("webrtc:ice_candidate") { args ->
                 val data = args.firstOrNull() as? JSONObject ?: return@on
-                handleICECandidate(data)
+                mainHandler.post { handleICECandidate(data) }
             }
 
             socket?.on("webrtc:stop") { args ->
                 val data = args.firstOrNull() as? JSONObject ?: return@on
-                handleWebRTCStop(data)
+                mainHandler.post { handleWebRTCStop(data) }
             }
 
             socket?.connect()
@@ -200,23 +249,28 @@ class CameraService : LifecycleService() {
         cameraProviderFuture.addListener({
             try {
                 val cameraProvider = cameraProviderFuture.get()
-                
+
+                // Configure recorder with compression (lower bitrate for smaller files)
+                val qualitySelector = QualitySelector.from(
+                    Quality.HD, // 720p for good balance
+                    FallbackStrategy.lowerQualityOrHigherThan(Quality.SD)
+                )
+
                 val frontRecorder = Recorder.Builder()
-                    .setQualitySelector(QualitySelector.from(Quality.HD))
+                    .setQualitySelector(qualitySelector)
                     .build()
                 frontVideoCapture = VideoCapture.withOutput(frontRecorder)
 
                 val backRecorder = Recorder.Builder()
-                    .setQualitySelector(QualitySelector.from(Quality.HD))
+                    .setQualitySelector(qualitySelector)
                     .build()
                 backVideoCapture = VideoCapture.withOutput(backRecorder)
 
                 frontPreview?.let { preview ->
                     val frontPreviewUseCase = Preview.Builder().build()
                     frontPreviewUseCase.setSurfaceProvider(preview.surfaceProvider)
-                    
+
                     try {
-                        cameraProvider.unbind(frontPreviewUseCase)
                         cameraProvider.bindToLifecycle(
                             this,
                             CameraSelector.DEFAULT_FRONT_CAMERA,
@@ -232,7 +286,7 @@ class CameraService : LifecycleService() {
                 backPreview?.let { preview ->
                     val backPreviewUseCase = Preview.Builder().build()
                     backPreviewUseCase.setSurfaceProvider(preview.surfaceProvider)
-                    
+
                     try {
                         cameraProvider.bindToLifecycle(
                             this,
@@ -260,58 +314,87 @@ class CameraService : LifecycleService() {
         }
 
         isRecording = true
+        recordingStartTime = System.currentTimeMillis()
         callbacks?.onRecordingStatusChanged(true)
         updateNotification("Recording...")
         notifyRecordingStatus(true)
 
+        startRecordingChunk()
+        scheduleNextChunk()
+
+        log("Recording started (15-min chunks, both cameras with audio)")
+    }
+
+    private fun startRecordingChunk() {
         val recordingsDir = File(filesDir, "recordings").apply { mkdirs() }
         val timestamp = System.currentTimeMillis()
 
+        // Front camera recording with audio
         frontVideoCapture?.let { videoCapture ->
             val file = File(recordingsDir, "front_$timestamp.mp4")
             val outputOptions = FileOutputOptions.Builder(file).build()
 
             frontRecording = videoCapture.output
                 .prepareRecording(this, outputOptions)
-                .withAudioEnabled()
+                .withAudioEnabled() // Audio enabled
                 .start(cameraExecutor) { event ->
                     when (event) {
-                        is VideoRecordEvent.Start -> log("Front camera recording started")
+                        is VideoRecordEvent.Start -> log("Front camera chunk started")
                         is VideoRecordEvent.Finalize -> {
                             if (event.hasError()) {
                                 log("Front recording error: ${event.error}")
+                                file.delete()
                             } else {
-                                log("Front recording saved: ${file.name}")
-                                uploadRecording(file, "front", timestamp)
+                                log("Front chunk saved: ${file.name} (${file.length() / 1024}KB)")
+                                uploadAndDeleteRecording(file, "front", timestamp)
                             }
                         }
                     }
                 }
         }
 
+        // Back camera recording with audio
         backVideoCapture?.let { videoCapture ->
             val file = File(recordingsDir, "back_$timestamp.mp4")
             val outputOptions = FileOutputOptions.Builder(file).build()
 
             backRecording = videoCapture.output
                 .prepareRecording(this, outputOptions)
-                .withAudioEnabled()
+                .withAudioEnabled() // Audio enabled
                 .start(cameraExecutor) { event ->
                     when (event) {
-                        is VideoRecordEvent.Start -> log("Back camera recording started")
+                        is VideoRecordEvent.Start -> log("Back camera chunk started")
                         is VideoRecordEvent.Finalize -> {
                             if (event.hasError()) {
                                 log("Back recording error: ${event.error}")
+                                file.delete()
                             } else {
-                                log("Back recording saved: ${file.name}")
-                                uploadRecording(file, "back", timestamp)
+                                log("Back chunk saved: ${file.name} (${file.length() / 1024}KB)")
+                                uploadAndDeleteRecording(file, "back", timestamp)
                             }
                         }
                     }
                 }
         }
+    }
 
-        log("Recording started on both cameras")
+    private fun scheduleNextChunk() {
+        chunkHandler = Handler(Looper.getMainLooper())
+        chunkRunnable = Runnable {
+            if (isRecording) {
+                log("Starting new 15-minute chunk...")
+                // Stop current recordings
+                frontRecording?.stop()
+                backRecording?.stop()
+                frontRecording = null
+                backRecording = null
+
+                // Start new chunk
+                startRecordingChunk()
+                scheduleNextChunk()
+            }
+        }
+        chunkHandler?.postDelayed(chunkRunnable!!, CHUNK_DURATION_MS)
     }
 
     private fun stopRecording() {
@@ -319,6 +402,11 @@ class CameraService : LifecycleService() {
             log("Not recording")
             return
         }
+
+        // Cancel scheduled chunk
+        chunkRunnable?.let { chunkHandler?.removeCallbacks(it) }
+        chunkHandler = null
+        chunkRunnable = null
 
         frontRecording?.stop()
         frontRecording = null
@@ -334,11 +422,13 @@ class CameraService : LifecycleService() {
         log("Recording stopped")
     }
 
-    private fun uploadRecording(file: File, cameraType: String, startedAt: Long) {
+    private fun uploadAndDeleteRecording(file: File, cameraType: String, startedAt: Long) {
         scope.launch {
             try {
                 val endedAt = System.currentTimeMillis()
                 val duration = ((endedAt - startedAt) / 1000).toInt()
+
+                log("Uploading ${file.name}...")
 
                 val requestBody = MultipartBody.Builder()
                     .setType(MultipartBody.FORM)
@@ -357,14 +447,31 @@ class CameraService : LifecycleService() {
                 httpClient.newCall(request).execute().use { response ->
                     if (response.isSuccessful) {
                         log("Uploaded: ${file.name}")
-                        file.delete()
+                        // Delete local file after successful upload
+                        if (file.delete()) {
+                            log("Deleted local: ${file.name}")
+                        }
                     } else {
-                        log("Upload failed: ${response.code}")
+                        log("Upload failed (${response.code}): ${file.name}")
+                        // Retry upload later - keep file
+                        retryUpload(file, cameraType, startedAt)
                     }
                 }
             } catch (e: Exception) {
                 log("Upload error: ${e.message}")
                 Log.e(TAG, "Upload error", e)
+                // Retry upload later
+                retryUpload(file, cameraType, startedAt)
+            }
+        }
+    }
+
+    private fun retryUpload(file: File, cameraType: String, startedAt: Long) {
+        scope.launch {
+            delay(30000) // Wait 30 seconds before retry
+            if (file.exists()) {
+                log("Retrying upload: ${file.name}")
+                uploadAndDeleteRecording(file, cameraType, startedAt)
             }
         }
     }
@@ -375,18 +482,210 @@ class CameraService : LifecycleService() {
         })
     }
 
+    // WebRTC handling
     private fun handleWebRTCOffer(data: JSONObject) {
-        // WebRTC implementation would go here
-        // For simplicity, this is a placeholder
-        log("WebRTC offer received from admin")
+        try {
+            val adminSocketId = data.getString("adminSocketId")
+            val offerJson = data.getJSONObject("offer")
+            val cameraType = data.optString("cameraType", "back")
+
+            log("WebRTC offer from admin for $cameraType camera")
+
+            val offer = SessionDescription(
+                SessionDescription.Type.OFFER,
+                offerJson.getString("sdp")
+            )
+
+            createPeerConnection(adminSocketId, cameraType)?.let { pc ->
+                pc.setRemoteDescription(object : SdpObserver {
+                    override fun onSetSuccess() {
+                        createAnswer(pc, adminSocketId, cameraType)
+                    }
+                    override fun onSetFailure(error: String?) {
+                        log("Set remote description failed: $error")
+                    }
+                    override fun onCreateSuccess(sdp: SessionDescription?) {}
+                    override fun onCreateFailure(error: String?) {}
+                }, offer)
+            }
+        } catch (e: Exception) {
+            log("WebRTC offer error: ${e.message}")
+            Log.e(TAG, "WebRTC offer error", e)
+        }
+    }
+
+    private fun createPeerConnection(adminSocketId: String, cameraType: String): PeerConnection? {
+        val key = "$adminSocketId-$cameraType"
+
+        // Close existing connection
+        peerConnections[key]?.close()
+
+        val iceServers = listOf(
+            PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer(),
+            PeerConnection.IceServer.builder("stun:stun1.l.google.com:19302").createIceServer()
+        )
+
+        val rtcConfig = PeerConnection.RTCConfiguration(iceServers).apply {
+            sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
+        }
+
+        val pc = peerConnectionFactory?.createPeerConnection(rtcConfig, object : PeerConnection.Observer {
+            override fun onIceCandidate(candidate: IceCandidate?) {
+                candidate?.let {
+                    socket?.emit("webrtc:ice_candidate", JSONObject().apply {
+                        put("targetId", adminSocketId)
+                        put("cameraType", cameraType)
+                        put("candidate", JSONObject().apply {
+                            put("sdpMid", it.sdpMid)
+                            put("sdpMLineIndex", it.sdpMLineIndex)
+                            put("candidate", it.sdp)
+                        })
+                    })
+                }
+            }
+
+            override fun onIceConnectionChange(state: PeerConnection.IceConnectionState?) {
+                log("ICE connection state: $state")
+                if (state == PeerConnection.IceConnectionState.DISCONNECTED ||
+                    state == PeerConnection.IceConnectionState.FAILED) {
+                    peerConnections.remove(key)?.close()
+                }
+            }
+
+            override fun onSignalingChange(state: PeerConnection.SignalingState?) {}
+            override fun onIceConnectionReceivingChange(receiving: Boolean) {}
+            override fun onIceGatheringChange(state: PeerConnection.IceGatheringState?) {}
+            override fun onIceCandidatesRemoved(candidates: Array<out IceCandidate>?) {}
+            override fun onAddStream(stream: MediaStream?) {}
+            override fun onRemoveStream(stream: MediaStream?) {}
+            override fun onDataChannel(channel: DataChannel?) {}
+            override fun onRenegotiationNeeded() {}
+            override fun onAddTrack(receiver: RtpReceiver?, streams: Array<out MediaStream>?) {}
+        })
+
+        pc?.let {
+            // Add video track
+            createVideoTrack(cameraType)?.let { track ->
+                it.addTrack(track)
+            }
+            // Add audio track
+            createAudioTrack()?.let { track ->
+                it.addTrack(track)
+            }
+            peerConnections[key] = it
+        }
+
+        return pc
+    }
+
+    private fun createVideoTrack(cameraType: String): VideoTrack? {
+        try {
+            val videoSource = peerConnectionFactory?.createVideoSource(false)
+
+            surfaceTextureHelper = SurfaceTextureHelper.create("CaptureThread", eglBase?.eglBaseContext)
+
+            val cameraEnumerator = Camera2Enumerator(this)
+            val deviceNames = cameraEnumerator.deviceNames
+
+            val targetCamera = if (cameraType == "front") {
+                deviceNames.find { cameraEnumerator.isFrontFacing(it) }
+            } else {
+                deviceNames.find { cameraEnumerator.isBackFacing(it) }
+            }
+
+            targetCamera?.let { cameraName ->
+                videoCapturer = cameraEnumerator.createCapturer(cameraName, null)
+                videoCapturer?.initialize(surfaceTextureHelper, this, videoSource?.capturerObserver)
+                videoCapturer?.startCapture(1280, 720, 30)
+            }
+
+            localVideoTrack = peerConnectionFactory?.createVideoTrack("video_$cameraType", videoSource)
+            return localVideoTrack
+        } catch (e: Exception) {
+            log("Create video track error: ${e.message}")
+            return null
+        }
+    }
+
+    private fun createAudioTrack(): AudioTrack? {
+        try {
+            val audioConstraints = MediaConstraints()
+            val audioSource = peerConnectionFactory?.createAudioSource(audioConstraints)
+            localAudioTrack = peerConnectionFactory?.createAudioTrack("audio", audioSource)
+            return localAudioTrack
+        } catch (e: Exception) {
+            log("Create audio track error: ${e.message}")
+            return null
+        }
+    }
+
+    private fun createAnswer(pc: PeerConnection, adminSocketId: String, cameraType: String) {
+        val constraints = MediaConstraints().apply {
+            mandatory.add(MediaConstraints.KeyValuePair("OfferToReceiveVideo", "false"))
+            mandatory.add(MediaConstraints.KeyValuePair("OfferToReceiveAudio", "false"))
+        }
+
+        pc.createAnswer(object : SdpObserver {
+            override fun onCreateSuccess(sdp: SessionDescription?) {
+                sdp?.let {
+                    pc.setLocalDescription(object : SdpObserver {
+                        override fun onSetSuccess() {
+                            socket?.emit("webrtc:answer", JSONObject().apply {
+                                put("adminSocketId", adminSocketId)
+                                put("cameraType", cameraType)
+                                put("answer", JSONObject().apply {
+                                    put("type", "answer")
+                                    put("sdp", it.description)
+                                })
+                            })
+                            log("WebRTC answer sent for $cameraType")
+                        }
+                        override fun onSetFailure(error: String?) {
+                            log("Set local description failed: $error")
+                        }
+                        override fun onCreateSuccess(sdp: SessionDescription?) {}
+                        override fun onCreateFailure(error: String?) {}
+                    }, it)
+                }
+            }
+            override fun onCreateFailure(error: String?) {
+                log("Create answer failed: $error")
+            }
+            override fun onSetSuccess() {}
+            override fun onSetFailure(error: String?) {}
+        }, constraints)
     }
 
     private fun handleICECandidate(data: JSONObject) {
-        log("ICE candidate received")
+        try {
+            val adminSocketId = data.getString("adminSocketId")
+            val cameraType = data.optString("cameraType", "back")
+            val candidateJson = data.getJSONObject("candidate")
+
+            val candidate = IceCandidate(
+                candidateJson.getString("sdpMid"),
+                candidateJson.getInt("sdpMLineIndex"),
+                candidateJson.getString("candidate")
+            )
+
+            val key = "$adminSocketId-$cameraType"
+            peerConnections[key]?.addIceCandidate(candidate)
+        } catch (e: Exception) {
+            log("ICE candidate error: ${e.message}")
+        }
     }
 
     private fun handleWebRTCStop(data: JSONObject) {
-        log("WebRTC stop received")
+        try {
+            val adminSocketId = data.getString("adminSocketId")
+            val cameraType = data.optString("cameraType", "back")
+            val key = "$adminSocketId-$cameraType"
+
+            peerConnections.remove(key)?.close()
+            log("WebRTC stopped for $cameraType")
+        } catch (e: Exception) {
+            log("WebRTC stop error: ${e.message}")
+        }
     }
 
     private fun acquireWakeLock() {
@@ -395,7 +694,7 @@ class CameraService : LifecycleService() {
             PowerManager.PARTIAL_WAKE_LOCK,
             "CameraSurveillance::WakeLock"
         )
-        wakeLock?.acquire(10 * 60 * 60 * 1000L) // 10 hours
+        wakeLock?.acquire(24 * 60 * 60 * 1000L) // 24 hours
     }
 
     private fun createNotificationChannel() {
@@ -435,13 +734,23 @@ class CameraService : LifecycleService() {
 
     private fun log(message: String) {
         Log.d(TAG, message)
-        callbacks?.onLog(message)
+        mainHandler.post { callbacks?.onLog(message) }
     }
 
     override fun onDestroy() {
         super.onDestroy()
         stopRecording()
         socket?.disconnect()
+
+        // Cleanup WebRTC
+        peerConnections.values.forEach { it.close() }
+        peerConnections.clear()
+        videoCapturer?.stopCapture()
+        videoCapturer?.dispose()
+        surfaceTextureHelper?.dispose()
+        peerConnectionFactory?.dispose()
+        eglBase?.release()
+
         wakeLock?.release()
         cameraExecutor.shutdown()
         scope.cancel()
