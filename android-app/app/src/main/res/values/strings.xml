@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Camera Surveillance</string>
+    <string name="notification_channel_name">Camera Service</string>
+    <string name="notification_channel_description">Shows when camera service is running</string>
+</resources>

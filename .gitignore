@@ -1,0 +1,44 @@
+# Dependencies
+node_modules/
+
+# Build outputs
+dist/
+build/
+*.apk
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Database
+*.db
+*.sqlite
+
+# Recordings (too large for git)
+server/recordings/*
+!server/recordings/.gitkeep
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+
+# Android
+android-app/.gradle/
+android-app/app/build/
+android-app/build/
+android-app/local.properties
+android-app/*.apk
+
+# Misc
+*.tmp
+*.temp
