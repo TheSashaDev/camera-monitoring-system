@@ -650,6 +650,7 @@ class CameraService : LifecycleService() {
                     
                     val success = uploadRecording(task)
                     
+                    var shouldDelay = false
                     synchronized(uploadRetryQueue) {
                         if (success) {
                             uploadRetryQueue.remove(task)
@@ -662,9 +663,12 @@ class CameraService : LifecycleService() {
                                 // Move to end of queue for retry
                                 uploadRetryQueue.remove(task)
                                 uploadRetryQueue.add(task)
-                                delay(30000) // Wait before retry
+                                shouldDelay = true
                             }
                         }
+                    }
+                    if (shouldDelay) {
+                        delay(30000) // Wait before retry
                     }
                 }
             } finally {
