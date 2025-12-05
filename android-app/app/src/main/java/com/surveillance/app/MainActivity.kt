@@ -24,7 +24,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var binding: ActivityMainBinding
     private var cameraService: CameraService? = null
     private var serviceBound = false
-    private val deviceId: String by lazy { getDeviceId() }
+    private val deviceId: String by lazy { obtainDeviceId() }
 
     private val requiredPermissions = mutableListOf(
         Manifest.permission.CAMERA,
@@ -193,7 +193,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun getDeviceId(): String {
+    private fun obtainDeviceId(): String {
         return Settings.Secure.getString(contentResolver, Settings.Secure.ANDROID_ID) 
             ?: UUID.randomUUID().toString()
     }
