@@ -3,13 +3,8 @@ name: Build Android APK
 on:
   push:
     branches: [main, master]
-    paths:
-      - 'android-app/**'
-      - '.github/workflows/build-android.yml'
   pull_request:
     branches: [main, master]
-    paths:
-      - 'android-app/**'
   workflow_dispatch:
 
 jobs:
@@ -29,10 +24,17 @@ jobs:
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
 
+      - name: Accept Android SDK licenses
+        run: yes | sdkmanager --licenses || true
+
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v3
         with:
           gradle-version: 8.4
+
+      - name: Create local.properties
+        run: |
+          echo "sdk.dir=$ANDROID_HOME" > android-app/local.properties
 
       - name: Generate Gradle Wrapper
         run: |
@@ -45,7 +47,7 @@ jobs:
       - name: Build Debug APK
         run: |
           cd android-app
-          ./gradlew assembleDebug --no-daemon
+          ./gradlew assembleDebug --no-daemon --stacktrace
 
       - name: Upload Debug APK
         uses: actions/upload-artifact@v4
@@ -66,4 +68,4 @@ jobs:
           name: app-release-unsigned
           path: android-app/app/build/outputs/apk/release/app-release-unsigned.apk
           retention-days: 30
-        if: success()
+        continue-on-error: true
